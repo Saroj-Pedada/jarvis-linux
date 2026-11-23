@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis "Hey Jarvis" wake word listener
+After=graphical-session.target jarvis-daemon.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/jarvis-wake
+Restart=always
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=graphical-session.target

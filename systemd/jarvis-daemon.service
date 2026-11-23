@@ -1,0 +1,11 @@
+[Unit]
+Description=Jarvis speech-to-text daemon (Whisper, kept warm on the GPU)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/jarvis-daemon
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

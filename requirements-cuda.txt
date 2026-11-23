@@ -1,0 +1,3 @@
+# CUDA libraries for running Whisper on an NVIDIA GPU (jarvis-daemon loads them from the venv).
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

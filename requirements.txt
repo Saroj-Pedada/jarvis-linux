@@ -1,0 +1,12 @@
+# Versions tested on EndeavourOS with Python 3.14 (November 2026).
+numpy>=2.0
+sounddevice>=0.5
+requests>=2.31
+PySide6-Essentials>=6.7
+faster-whisper>=1.1
+onnxruntime>=1.18
+# openwakeword is installed with --no-deps by install.sh (its tflite dependency
+# has no wheels for new Pythons); these are the parts it actually needs:
+scipy>=1.11
+scikit-learn>=1.4
+tqdm>=4.66

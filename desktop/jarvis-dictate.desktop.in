@@ -1,0 +1,8 @@
+[Desktop Entry]
+Exec=@BINDIR@/jarvis-ctl dictate
+Name=Jarvis Dictation
+Comment=Type what you say into the focused window
+NoDisplay=true
+StartupNotify=false
+Type=Application
+X-KDE-GlobalAccel-CommandShortcut=true

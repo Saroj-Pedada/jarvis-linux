@@ -1,0 +1,8 @@
+[Desktop Entry]
+Exec=@BINDIR@/jarvis-ctl assist
+Name=Jarvis Assistant
+Comment=Ask Jarvis a question or give it a command
+NoDisplay=true
+StartupNotify=false
+Type=Application
+X-KDE-GlobalAccel-CommandShortcut=true

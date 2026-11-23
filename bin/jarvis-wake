@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Always-on "Hey Jarvis" listener. Runs `jarvis-ctl assist` when the wake word is heard.
+
+Audio is processed in memory on this machine only; nothing is recorded or sent anywhere.
+"""
+import os, subprocess, sys, time
+import numpy as np
+import sounddevice as sd
+from openwakeword.model import Model
+
+
+def _load_config():
+    """Load KEY=VALUE lines from ~/.config/jarvis/jarvis.env (real env vars win)."""
+    path = os.path.expanduser(os.environ.get("JARVIS_CONFIG", "~/.config/jarvis/jarvis.env"))
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+_load_config()
+
+THRESHOLD = float(os.environ.get("JARVIS_WAKE_THRESHOLD", "0.5"))  # raise if it triggers by mistake
+FRAME = 1280  # 80 ms at 16 kHz, what openWakeWord expects
+LOCK_FILE = os.path.join(os.path.expanduser(os.environ.get("JARVIS_HOME", "~/.local/share/jarvis")), "jarvis.lock")
+JARVIS_CTL = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jarvis-ctl")
+
+
+def jarvis_busy():
+    """True while jarvis-ctl is already running (shortcut, dictation, or a previous wake)."""
+    try:
+        with open(LOCK_FILE) as f:
+            pid = int(f.read().strip() or 0)
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def main():
+    model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+    print(f"Listening for 'Hey Jarvis' (threshold {THRESHOLD})", flush=True)
+    while True:
+        triggered = False
+        # Mic is opened per listening session and closed before jarvis-ctl runs,
+        # so the two never compete for it and Jarvis's own voice can't re-trigger it.
+        with sd.InputStream(samplerate=16000, channels=1, dtype="int16", blocksize=FRAME) as stream:
+            beat_t, beat_rms, beat_score, beat_n, beat_busy, beat_over = time.time(), 0.0, 0.0, 0, 0, 0
+            while not triggered:
+                data, overflow = stream.read(FRAME)
+                frame = np.squeeze(data)
+                beat_rms += float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                beat_n += 1
+                beat_over += int(bool(overflow))
+                if jarvis_busy():
+                    beat_busy += 1
+                    model.reset()
+                else:
+                    score = model.predict(frame)["hey_jarvis"]
+                    beat_score = max(beat_score, score)
+                    if score >= THRESHOLD:
+                        print(f"Wake word heard (score {score:.2f})", flush=True)
+                        triggered = True
+                if time.time() - beat_t >= 30:
+                    avg = beat_rms / max(beat_n, 1)
+                    print(f"alive: mic level {avg:.0f}, best score {beat_score:.2f}, "
+                          f"busy frames {beat_busy}, overflows {beat_over}", flush=True)
+                    if avg < 1.0:  # mic stream went dead (all zeros): reopen it
+                        print("Mic stream silent, reopening", flush=True)
+                        break
+                    beat_t, beat_rms, beat_score, beat_n, beat_busy, beat_over = time.time(), 0.0, 0.0, 0, 0, 0
+        if triggered:
+            t0 = time.time()
+            rc = subprocess.run([JARVIS_CTL, "assist"]).returncode
+            print(f"jarvis-ctl finished (exit {rc}, {time.time() - t0:.1f}s)", flush=True)
+            model.reset()
+            time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+import os, re, sys, json, time, socket, struct, subprocess, threading
+import numpy as np
+import sounddevice as sd
+import requests
+
+from PySide6.QtWidgets import QApplication, QWidget, QLabel, QHBoxLayout
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QPainter, QColor, QBrush, QLinearGradient
+
+
+def _load_config():
+    """Load KEY=VALUE lines from ~/.config/jarvis/jarvis.env (real env vars win)."""
+    path = os.path.expanduser(os.environ.get("JARVIS_CONFIG", "~/.config/jarvis/jarvis.env"))
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+_load_config()
+
+STATE_DIR = os.path.expanduser(os.environ.get("JARVIS_HOME", "~/.local/share/jarvis"))
+LOCK_FILE = os.path.join(STATE_DIR, "jarvis.lock")
+SOCK_PATH = os.environ.get("JARVIS_SOCK", os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "jarvis.sock"))
+VOICE_MODEL = os.environ.get("JARVIS_VOICE", "/usr/share/piper-voices/en/en_US/ryan/high/en_US-ryan-high.onnx")
+LLM_MODEL = os.environ.get("JARVIS_LLM", "qwen2.5:3b")
+OLLAMA_URL = os.environ.get("JARVIS_OLLAMA_URL", "http://localhost:11434")
+
+
+def transcribe_fast(audio_f32):
+    """Sends normalized float32 audio to the warm VRAM daemon."""
+    peak = np.max(np.abs(audio_f32)) if audio_f32.size else 0
+    if peak > 0:
+        audio_f32 = (audio_f32 / peak) * 0.9
+    payload = audio_f32.astype(np.float32).tobytes()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(20)
+        s.connect(SOCK_PATH)
+        s.sendall(struct.pack("!I", len(payload)) + payload)
+        # Daemon closes the connection after replying; read until EOF.
+        buf = bytearray()
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return buf.decode("utf-8", errors="ignore").strip()
+
+
+def inject_text(text):
+    """Types text into the active KDE Wayland/X11 window."""
+    if not text:
+        return
+    clean = text.strip() + " "
+    res = subprocess.run(["ydotool", "type", "--key-delay", "1", clean], capture_output=True)
+    if res.returncode != 0:
+        subprocess.run(["wl-copy", clean], check=False)
+        subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], check=False)
+
+
+def play_chime(kind="start"):
+    try:
+        fs = 44100
+        t = np.linspace(0, 0.12, int(fs * 0.12), False)
+        f1, f2 = (540, 810) if kind == "start" else (660, 440)
+        tone1 = np.sin(f1 * 2 * np.pi * t[:len(t) // 2])
+        tone2 = np.sin(f2 * 2 * np.pi * t[len(t) // 2:])
+        wave = np.concatenate([tone1, tone2]) * np.exp(-t * 14) * 0.22
+        sd.play(wave.astype(np.float32), fs, blocking=False)
+    except Exception:
+        pass
+
+
+class WorkerSignals(QObject):
+    state_changed = Signal(str, str)
+    level_changed = Signal(float)
+    finished = Signal()
+
+
+class SiriPill(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFixedSize(440, 64)
+
+        self.state = "listening"
+        self.level = 0.0
+        self.phase = 0.0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(68, 0, 20, 0)
+        self.label = QLabel("Listening...")
+        self.label.setStyleSheet(
+            "color: white; font-size: 14px; font-weight: 600; font-family: 'Noto Sans', sans-serif;"
+        )
+        layout.addWidget(self.label)
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.x() + (screen.width() - self.width()) // 2,
+                  screen.y() + screen.height() - 100)
+
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self.animate)
+        self.anim_timer.start(30)
+
+    def animate(self):
+        self.phase += 0.25
+        self.update()
+
+    def set_state(self, state, text):
+        self.state = state
+        self.label.setText(text)
+        self.update()
+
+    def set_level(self, lvl):
+        self.level = max(0.0, min(1.0, lvl))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QBrush(QColor(18, 20, 28, 235)))
+        p.setPen(QColor(255, 255, 255, 35))
+        p.drawRoundedRect(2, 2, self.width() - 4, self.height() - 4, 30, 30)
+
+        cx, cy = 34, 32
+        pulse = (np.sin(self.phase) * 3) if self.state != "listening" else (self.level * 12)
+        radius = 12 + pulse
+
+        grad = QLinearGradient(cx - 18, cy - 18, cx + 18, cy + 18)
+        if self.state == "listening":
+            grad.setColorAt(0, QColor(0, 210, 255, 220))
+            grad.setColorAt(1, QColor(140, 80, 255, 220))
+        elif self.state == "thinking":
+            grad.setColorAt(0, QColor(255, 160, 0, 220))
+            grad.setColorAt(1, QColor(255, 60, 120, 220))
+        else:
+            grad.setColorAt(0, QColor(0, 230, 140, 220))
+            grad.setColorAt(1, QColor(0, 160, 255, 220))
+
+        p.setBrush(QBrush(grad))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(int(cx - radius), int(cy - radius), int(radius * 2), int(radius * 2))
+        p.end()
+
+
+def speak(text):
+    if not text or not os.path.exists(VOICE_MODEL):
+        return
+    try:
+        p1 = subprocess.Popen(["piper-tts", "--model", VOICE_MODEL, "--output_raw"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p2 = subprocess.Popen(["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
+                              stdin=p1.stdout)
+        p1.stdout.close()  # let p1 get SIGPIPE if aplay exits
+        p1.stdin.write(text.encode("utf-8"))
+        p1.stdin.close()
+        p2.wait(timeout=60)
+        p1.wait(timeout=5)
+    except Exception:
+        pass
+
+
+# Optional: set JARVIS_CITY (e.g. "Hyderabad") in the environment; otherwise wttr.in guesses from your IP.
+WEATHER_CITY = os.environ.get("JARVIS_CITY", "")
+WEATHER_WORDS = re.compile(r"\b(weather|temperature|forecast|rain|raining|umbrella|sunny|humid|humidity|"
+                           r"hot|cold|snow|wind|windy|cloudy|degrees)\b")
+MEDIA_FAST = re.compile(r"^(?:jarvis\s+)?(pause|play|resume|stop|next|skip|previous|back)"
+                        r"(?:\s+(?:the\s+)?(?:song|track|music|video|media))?$")
+MEDIA_ACTION = {"pause": ("pause", "Paused."), "play": ("play", "Playing."), "resume": ("play", "Resuming."),
+                "stop": ("stop", "Stopped."), "next": ("next", "Next track."), "skip": ("next", "Skipped."),
+                "previous": ("previous", "Previous track."), "back": ("previous", "Previous track.")}
+
+
+def fetch_weather():
+    """Short plain-text weather summary for the LLM, or '' if unavailable."""
+    try:
+        d = requests.get(f"https://wttr.in/{WEATHER_CITY}?format=j1", timeout=6).json()
+        cur = d["current_condition"][0]
+        place = d["nearest_area"][0]["areaName"][0]["value"]
+        parts = [f"Weather in {place} now: {cur['weatherDesc'][0]['value']}, {cur['temp_C']} degrees "
+                 f"(feels like {cur['FeelsLikeC']} degrees), humidity {cur['humidity']}%."]
+        for label, day in zip(["Today", "Tomorrow"], d["weather"][:2]):
+            rain = max(int(h.get("chanceofrain", 0)) for h in day["hourly"])
+            parts.append(f"{label}: low {day['mintempC']} degrees, high {day['maxtempC']} degrees, "
+                         f"chance of rain up to {rain}%.")
+        return " ".join(parts)
+    except Exception:
+        return ""
+
+
+def execute_action(text):
+    low = text.lower().strip()
+    words = re.sub(r"[^\w\s%]", "", low).strip()
+    if re.search(r"\b(volume up|increase (the )?volume|louder)\b", low):
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"])
+        return "Volume up."
+    if re.search(r"\b(volume down|decrease (the )?volume|quieter)\b", low):
+        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-10%"])
+        return "Volume down."
+    if re.search(r"\b(un)?mute\b", low):
+        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"])
+        return "Toggled mute."
+    if re.search(r"\b(brightness up|increase (the )?brightness|brighter)\b", low):
+        subprocess.run(["brightnessctl", "set", "+10%"])
+        return "Brightness up."
+    if re.search(r"\b(brightness down|decrease (the )?brightness|dimmer)\b", low):
+        subprocess.run(["brightnessctl", "set", "10%-"])
+        return "Brightness down."
+    m = MEDIA_FAST.match(words)
+    if m:
+        sub, reply = MEDIA_ACTION[m.group(1)]
+        r = subprocess.run(["playerctl", sub], capture_output=True)
+        return reply if r.returncode == 0 else "Nothing is playing right now."
+    if re.search(r"\bwhat(?:'s| is)? the time\b|\bwhat time is it\b", low):
+        return time.strftime("It's %-I:%M %p.")
+    if re.search(r"\bwhat(?:'s| is)? (?:the |today'?s )?date\b|\bwhat day is (?:it|today)\b", low):
+        return time.strftime("It's %A, %B %-d.")
+
+    context = f"Current local time: {time.strftime('%A %d %B %Y, %I:%M %p')}."
+    if WEATHER_WORDS.search(low):
+        weather = fetch_weather()
+        context += " " + (weather or "Weather data is unavailable right now.")
+
+    prompt = (
+        "You are Jarvis, a friendly, concise voice assistant on a Linux desktop (EndeavourOS KDE Plasma). "
+        "Your reply is spoken aloud, so use plain sentences: no markdown, lists or emojis. "
+        "Respond strictly in JSON with keys 'cmd' and 'reply'.\n"
+        "If the user wants a desktop action, put one command in 'cmd'. Only these programs may be used: "
+        "pactl, wpctl, brightnessctl, playerctl (play, pause, play-pause, next, previous, stop), "
+        "xdg-open (http/https URLs only), firefox, dolphin, konsole, kate, spectacle, systemsettings. "
+        "No pipes, redirects, sudo or chaining.\n"
+        "Otherwise (questions, chat, weather, facts) set 'cmd' to an empty string and answer in 'reply' "
+        "in under 40 words. Use the context below for time and weather; never invent weather. "
+        "If you don't know something, say so briefly.\n"
+        "Examples: 'set volume to 50%' -> {\"cmd\": \"pactl set-sink-volume @DEFAULT_SINK@ 50%\", "
+        "\"reply\": \"Volume set to 50 percent.\"}; "
+        "'pause the music' -> {\"cmd\": \"playerctl pause\", \"reply\": \"Paused.\"}; "
+        "'play the next song' -> {\"cmd\": \"playerctl next\", \"reply\": \"Next track.\"}; "
+        "'how are you?' -> {\"cmd\": \"\", \"reply\": \"Doing well, thanks. What can I do for you?\"}.\n"
+        f"Context: {context}\n"
+        f"User: {text}"
+    )
+    try:
+        res = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": LLM_MODEL, "prompt": prompt, "format": "json", "stream": False,
+                  "keep_alive": "30m", "options": {"num_predict": 160, "temperature": 0.4}},
+            timeout=90,
+        ).json()
+        data = json.loads(res.get("response", "{}") or "{}")
+    except Exception:
+        return "Couldn't reach the local model."
+    cmd = str(data.get("cmd", "") or "").strip()
+    reply = str(data.get("reply", "") or "Done.")
+    if cmd:
+        argv = check_allowed(cmd)
+        if argv is None:
+            return "Sorry, I'm not allowed to run that."
+        try:
+            subprocess.Popen(argv, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return "That command isn't installed."
+    return reply
+
+
+# Commands the LLM may run. Key = binary, value = allowed first argument
+# (subcommand), or None meaning any arguments are fine.
+ALLOWED_CMDS = {
+    "pactl": {"set-sink-volume", "set-sink-mute", "set-source-volume", "set-source-mute"},
+    "wpctl": {"set-volume", "set-mute"},
+    "brightnessctl": {"set", "-s", "-r"},
+    "playerctl": {"play", "pause", "play-pause", "next", "previous", "stop"},
+    "xdg-open": None,
+    "firefox": None,
+    "dolphin": None,
+    "konsole": None,
+    "kate": None,
+    "spectacle": None,
+    "systemsettings": None,
+}
+SHELL_META = set(";|&`$<>\n\\(){}")
+
+
+def check_allowed(cmd):
+    """Returns argv list if cmd is on the allowlist, else None. Never uses a shell."""
+    import shlex
+    if any(c in SHELL_META for c in cmd):
+        return None
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    binary = argv[0]
+    if binary not in ALLOWED_CMDS:  # rejects paths, sudo, rm, etc.
+        return None
+    subs = ALLOWED_CMDS[binary]
+    if subs is not None and (len(argv) < 2 or argv[1] not in subs):
+        return None
+    if binary == "xdg-open" and (len(argv) != 2 or not argv[1].startswith(("http://", "https://"))):
+        return None
+    return argv
+
+
+def rms_of(data):
+    return float(np.sqrt(np.mean(data.astype(np.float32) ** 2)))
+
+
+def run_pipeline(mode, signals):
+    try:
+        fs = 16000
+        chunk_size = 1600  # 0.1s
+        play_chime("start")
+        signals.state_changed.emit("listening", "Listening..." if mode == "assist" else "Dictating (speak now)...")
+
+        has_spoken = False
+        chunks = []
+        with sd.InputStream(samplerate=fs, channels=1, dtype="int16") as stream:
+            # Auto-calibrate mic noise floor (0.2s)
+            noise = [rms_of(stream.read(chunk_size)[0]) for _ in range(2)]
+            threshold = max(float(np.mean(noise)), 20.0) * 2.1
+
+            if mode == "dictate":
+                phrase_chunks = []
+                silent_chunks = 0
+                idle_chunks = 0
+
+                while True:
+                    data, _ = stream.read(chunk_size)
+                    rms = rms_of(data)
+                    signals.level_changed.emit(min(1.0, rms / (threshold * 3.0)))
+
+                    if rms > threshold:
+                        has_spoken = True
+                        silent_chunks = 0
+                        idle_chunks = 0
+                        phrase_chunks.append(data)
+                    elif has_spoken:
+                        silent_chunks += 1
+                        phrase_chunks.append(data)
+                        if silent_chunks >= 5 or len(phrase_chunks) >= 18:
+                            audio = np.concatenate(phrase_chunks, axis=0).flatten().astype(np.float32)
+                            phrase_chunks = []
+                            has_spoken = False
+                            silent_chunks = 0
+                            text = transcribe_fast(audio)
+                            if text:
+                                signals.state_changed.emit("speaking", f"→ {text[-34:]}")
+                                inject_text(text)
+                                signals.state_changed.emit("listening", "Dictating...")
+                    else:
+                        idle_chunks += 1
+                        if idle_chunks >= 22:
+                            break
+                play_chime("stop")
+                return
+
+            # ASSIST MODE
+            silent_chunks = 0
+            for _ in range(90):
+                data, _ = stream.read(chunk_size)
+                chunks.append(data)
+                rms = rms_of(data)
+                signals.level_changed.emit(min(1.0, rms / (threshold * 3.0)))
+
+                if rms > threshold:
+                    has_spoken = True
+                    silent_chunks = 0
+                elif has_spoken:
+                    silent_chunks += 1
+                    if silent_chunks >= 8:
+                        break
+                elif len(chunks) > 30:
+                    break
+
+        play_chime("stop")
+        if not has_spoken:
+            return
+
+        signals.state_changed.emit("thinking", "Thinking...")
+        audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
+        text = transcribe_fast(audio)
+        if not text:
+            return
+
+        reply = execute_action(text)
+        signals.state_changed.emit("speaking", reply)
+        speak(reply)
+    except Exception as e:
+        signals.state_changed.emit("thinking", f"Err: {str(e)[:30]}")
+        time.sleep(2.0)
+    finally:
+        release_lock()
+        signals.finished.emit()
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def acquire_lock():
+    """Returns True if we got the lock. Clears stale locks left by crashed runs."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write(str(os.getpid()))
+            return True
+        except FileExistsError:
+            try:
+                with open(LOCK_FILE) as f:
+                    pid = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                pid = 0
+            if pid and pid_alive(pid):
+                return False
+            try:
+                os.remove(LOCK_FILE)  # stale
+            except FileNotFoundError:
+                pass
+    return False
+
+
+def release_lock():
+    try:
+        with open(LOCK_FILE) as f:
+            if f.read().strip() == str(os.getpid()):
+                os.remove(LOCK_FILE)
+    except (OSError, ValueError):
+        pass
+
+
+if __name__ == "__main__":
+    if not acquire_lock():
+        sys.exit(0)
+
+    mode = sys.argv[1] if len(sys.argv) > 1 else "assist"
+    app = QApplication(sys.argv)
+    pill = SiriPill()
+    signals = WorkerSignals()
+    signals.state_changed.connect(pill.set_state)
+    signals.level_changed.connect(pill.set_level)
+    signals.finished.connect(app.quit)
+    pill.show()
+    threading.Thread(target=run_pipeline, args=(mode, signals), daemon=True).start()
+    try:
+        sys.exit(app.exec())
+    finally:
+        release_lock()
