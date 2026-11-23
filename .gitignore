@@ -4,3 +4,7 @@ __pycache__/
 *.wav
 *.bak
 *.lock
+
+skills-lock.json
+.agents
+.claude
