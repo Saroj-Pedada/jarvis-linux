@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-import os, re, sys, json, time, socket, struct, subprocess, threading
+import os, re, sys, json, time, shlex, shutil, socket, struct, subprocess, threading
 import numpy as np
 import sounddevice as sd
 import requests
 
-from PySide6.QtWidgets import QApplication, QWidget, QLabel, QHBoxLayout
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QPainter, QColor, QBrush, QLinearGradient
+try:
+    from PySide6.QtWidgets import QApplication, QWidget, QLabel, QHBoxLayout
+    from PySide6.QtCore import Qt, QTimer, Signal, QObject
+    from PySide6.QtGui import QPainter, QColor, QBrush, QLinearGradient
+    QT_ERROR = None
+except ImportError as e:  # reported by `jarvis-ctl doctor`; the overlay needs Qt
+    QT_ERROR = e
+    QWidget = QObject = object
+    Signal = lambda *a, **k: None  # noqa: E731
 
 
 def _load_config():
@@ -28,7 +34,16 @@ _load_config()
 STATE_DIR = os.path.expanduser(os.environ.get("JARVIS_HOME", "~/.local/share/jarvis"))
 LOCK_FILE = os.path.join(STATE_DIR, "jarvis.lock")
 SOCK_PATH = os.environ.get("JARVIS_SOCK", os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "jarvis.sock"))
-VOICE_MODEL = os.environ.get("JARVIS_VOICE", "/usr/share/piper-voices/en/en_US/ryan/high/en_US-ryan-high.onnx")
+def _default_voice():
+    for path in (os.path.join(STATE_DIR, "voices", "en_US-ryan-high.onnx"),          # installed by install.sh
+                 "/usr/share/piper-voices/en/en_US/ryan/high/en_US-ryan-high.onnx"):  # Arch piper-voices pkg
+        if os.path.exists(path):
+            return path
+    return os.path.join(STATE_DIR, "voices", "en_US-ryan-high.onnx")
+
+
+VOICE_MODEL = os.environ.get("JARVIS_VOICE") or _default_voice()
+SESSION = os.environ.get("XDG_SESSION_TYPE", "wayland" if os.environ.get("WAYLAND_DISPLAY") else "x11")
 LLM_MODEL = os.environ.get("JARVIS_LLM", "qwen2.5:3b")
 OLLAMA_URL = os.environ.get("JARVIS_OLLAMA_URL", "http://localhost:11434")
 
@@ -53,15 +68,41 @@ def transcribe_fast(audio_f32):
         return buf.decode("utf-8", errors="ignore").strip()
 
 
+def _run_ok(argv, **kw):
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=15, **kw).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def typing_tools():
+    """Typing methods usable in this session, best first."""
+    tools = []
+    if shutil.which("ydotool"):
+        tools.append("ydotool")            # works everywhere, needs ydotoold + /dev/uinput access
+    if SESSION == "wayland" and shutil.which("wtype"):
+        tools.append("wtype")              # wlroots compositors (Sway, Hyprland, ...)
+    if SESSION == "x11" and shutil.which("xdotool"):
+        tools.append("xdotool")
+    return tools
+
+
 def inject_text(text):
-    """Types text into the active KDE Wayland/X11 window."""
+    """Types text into the focused window (Wayland or X11), falling back to a clipboard paste."""
     if not text:
         return
     clean = text.strip() + " "
-    res = subprocess.run(["ydotool", "type", "--key-delay", "1", clean], capture_output=True)
-    if res.returncode != 0:
-        subprocess.run(["wl-copy", clean], check=False)
-        subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], check=False)
+    for tool in typing_tools():
+        argv = {"ydotool": ["ydotool", "type", "--key-delay", "1", clean],
+                "wtype": ["wtype", clean],
+                "xdotool": ["xdotool", "type", "--delay", "1", clean]}[tool]
+        if _run_ok(argv):
+            return
+    # Last resort: copy to clipboard and press Ctrl+V.
+    if SESSION == "wayland" and _run_ok(["wl-copy", clean]):
+        _run_ok(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]) or _run_ok(["wtype", "-M", "ctrl", "v", "-m", "ctrl"])
+    elif _run_ok(["xclip", "-selection", "clipboard"], input=clean.encode()):
+        _run_ok(["xdotool", "key", "ctrl+v"])
 
 
 def play_chime(kind="start"):
@@ -153,19 +194,39 @@ class SiriPill(QWidget):
         p.end()
 
 
-def speak(text):
+def synthesize(text):
+    """Returns (int16 samples, sample_rate) for text, or (None, 0). Prefers Piper's Python API."""
     if not text or not os.path.exists(VOICE_MODEL):
-        return
+        return None, 0
     try:
-        p1 = subprocess.Popen(["piper-tts", "--model", VOICE_MODEL, "--output_raw"],
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p2 = subprocess.Popen(["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
-                              stdin=p1.stdout)
-        p1.stdout.close()  # let p1 get SIGPIPE if aplay exits
-        p1.stdin.write(text.encode("utf-8"))
-        p1.stdin.close()
-        p2.wait(timeout=60)
-        p1.wait(timeout=5)
+        from piper import PiperVoice  # pip package installed by install.sh
+        voice = PiperVoice.load(VOICE_MODEL)
+        chunks = list(voice.synthesize(text))
+        if chunks:
+            return np.concatenate([c.audio_int16_array for c in chunks]), chunks[0].sample_rate
+    except ImportError:
+        pass
+    except Exception:
+        return None, 0
+    # Fallback: a system Piper binary (e.g. Arch's piper-tts-bin).
+    for exe in ("piper-tts", "piper"):
+        if shutil.which(exe):
+            try:
+                rate = json.load(open(VOICE_MODEL + ".json"))["audio"]["sample_rate"]
+            except Exception:
+                rate = 22050
+            res = subprocess.run([exe, "--model", VOICE_MODEL, "--output_raw"], input=text.encode(),
+                                 capture_output=True, timeout=60)
+            if res.returncode == 0 and res.stdout:
+                return np.frombuffer(res.stdout, dtype=np.int16), rate
+    return None, 0
+
+
+def speak(text):
+    try:
+        audio, rate = synthesize(text)
+        if audio is not None:
+            sd.play(audio, rate, blocking=True)
     except Exception:
         pass
 
@@ -198,17 +259,41 @@ def fetch_weather():
         return ""
 
 
+def volume(change):
+    """change: '+10%', '-10%', '40%' or 'mute'. Uses pactl (PulseAudio/PipeWire) or wpctl (WirePlumber)."""
+    if shutil.which("pactl"):
+        if change == "mute":
+            return _run_ok(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"])
+        return _run_ok(["pactl", "set-sink-volume", "@DEFAULT_SINK@", change])
+    if shutil.which("wpctl"):
+        if change == "mute":
+            return _run_ok(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        wp = change[1:-1] + "%" + change[0] if change[0] in "+-" else change  # wpctl wants 10%+ / 10%-
+        return _run_ok(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", wp])
+    return False
+
+
+def _volume_example():
+    if "pactl" in ALLOWED_CMDS:
+        return "pactl set-sink-volume @DEFAULT_SINK@ 50%"
+    return "wpctl set-volume @DEFAULT_AUDIO_SINK@ 50%"
+
+
+def _desktop_name():
+    return os.environ.get("XDG_CURRENT_DESKTOP", "").replace(":", " ") or "desktop"
+
+
 def execute_action(text):
     low = text.lower().strip()
     words = re.sub(r"[^\w\s%]", "", low).strip()
     if re.search(r"\b(volume up|increase (the )?volume|louder)\b", low):
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"])
+        volume("+10%")
         return "Volume up."
     if re.search(r"\b(volume down|decrease (the )?volume|quieter)\b", low):
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-10%"])
+        volume("-10%")
         return "Volume down."
     if re.search(r"\b(un)?mute\b", low):
-        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"])
+        volume("mute")
         return "Toggled mute."
     if re.search(r"\b(brightness up|increase (the )?brightness|brighter)\b", low):
         subprocess.run(["brightnessctl", "set", "+10%"])
@@ -232,17 +317,19 @@ def execute_action(text):
         context += " " + (weather or "Weather data is unavailable right now.")
 
     prompt = (
-        "You are Jarvis, a friendly, concise voice assistant on a Linux desktop (EndeavourOS KDE Plasma). "
+        f"You are Jarvis, a friendly, concise voice assistant on a Linux {_desktop_name()} desktop. "
         "Your reply is spoken aloud, so use plain sentences: no markdown, lists or emojis. "
         "Respond strictly in JSON with keys 'cmd' and 'reply'.\n"
         "If the user wants a desktop action, put one command in 'cmd'. Only these programs may be used: "
-        "pactl, wpctl, brightnessctl, playerctl (play, pause, play-pause, next, previous, stop), "
-        "xdg-open (http/https URLs only), firefox, dolphin, konsole, kate, spectacle, systemsettings. "
+        f"{', '.join(k for k in CONTROL_CMDS if k in ALLOWED_CMDS and k != 'xdg-open')}"
+        " (playerctl: play, pause, play-pause, next, previous, stop), "
+        "xdg-open (http/https URLs only)"
+        f"{', and these apps: ' + ', '.join(APPS) if APPS else ''}. "
         "No pipes, redirects, sudo or chaining.\n"
         "Otherwise (questions, chat, weather, facts) set 'cmd' to an empty string and answer in 'reply' "
         "in under 40 words. Use the context below for time and weather; never invent weather. "
         "If you don't know something, say so briefly.\n"
-        "Examples: 'set volume to 50%' -> {\"cmd\": \"pactl set-sink-volume @DEFAULT_SINK@ 50%\", "
+        f"Examples: 'set volume to 50%' -> {{\"cmd\": \"{_volume_example()}\", "
         "\"reply\": \"Volume set to 50 percent.\"}; "
         "'pause the music' -> {\"cmd\": \"playerctl pause\", \"reply\": \"Paused.\"}; "
         "'play the next song' -> {\"cmd\": \"playerctl next\", \"reply\": \"Next track.\"}; "
@@ -276,19 +363,32 @@ def execute_action(text):
 
 # Commands the LLM may run. Key = binary, value = allowed first argument
 # (subcommand), or None meaning any arguments are fine.
-ALLOWED_CMDS = {
+CONTROL_CMDS = {
     "pactl": {"set-sink-volume", "set-sink-mute", "set-source-volume", "set-source-mute"},
     "wpctl": {"set-volume", "set-mute"},
     "brightnessctl": {"set", "-s", "-r"},
     "playerctl": {"play", "pause", "play-pause", "next", "previous", "stop"},
     "xdg-open": None,
-    "firefox": None,
-    "dolphin": None,
-    "konsole": None,
-    "kate": None,
-    "spectacle": None,
-    "systemsettings": None,
 }
+# Desktop apps Jarvis may launch, if installed. Add your own with JARVIS_EXTRA_APPS=app1,app2.
+APP_CANDIDATES = [
+    # browsers
+    "firefox", "chromium", "google-chrome-stable", "brave", "brave-browser", "vivaldi", "librewolf",
+    # file managers
+    "dolphin", "nautilus", "thunar", "nemo", "pcmanfm", "pcmanfm-qt", "caja",
+    # terminals
+    "konsole", "gnome-terminal", "kgx", "ptyxis", "xfce4-terminal", "tilix", "alacritty", "kitty", "foot", "wezterm",
+    # editors
+    "kate", "kwrite", "gedit", "gnome-text-editor", "mousepad", "xed", "pluma", "code",
+    # screenshots
+    "spectacle", "gnome-screenshot", "flameshot", "xfce4-screenshooter",
+    # settings, calculators, music
+    "systemsettings", "gnome-control-center", "xfce4-settings-manager", "cinnamon-settings",
+    "kcalc", "gnome-calculator", "galculator", "spotify", "vlc", "rhythmbox", "elisa",
+]
+APPS = [a for a in dict.fromkeys(APP_CANDIDATES + [x.strip() for x in os.environ.get("JARVIS_EXTRA_APPS", "").split(",") if x.strip()])
+        if shutil.which(a)]
+ALLOWED_CMDS = {**{k: v for k, v in CONTROL_CMDS.items() if shutil.which(k)}, **{a: None for a in APPS}}
 SHELL_META = set(";|&`$<>\n\\(){}")
 
 
@@ -449,7 +549,67 @@ def release_lock():
         pass
 
 
+def doctor():
+    """`jarvis-ctl doctor`: check every piece Jarvis needs and print what works."""
+    ok_all = True
+
+    def row(ok, name, detail, required=True):
+        nonlocal ok_all
+        mark = "\033[32m ok \033[0m" if ok else ("\033[31mFAIL\033[0m" if required else "\033[33mwarn\033[0m")
+        ok_all &= ok or not required
+        print(f"[{mark}] {name:<16} {detail}")
+
+    print(f"Session: {SESSION}, desktop: {_desktop_name()}\n")
+    row(QT_ERROR is None, "overlay (Qt)", "PySide6 loaded" if QT_ERROR is None else
+        f"{QT_ERROR}. Install your distro's OpenGL/EGL and xcb-cursor libraries (./install.sh --deps)")
+    try:
+        dev = sd.query_devices(kind="input")
+        row(True, "microphone", dev["name"])
+    except Exception as e:
+        row(False, "microphone", f"no input device ({e})")
+    try:
+        dev = sd.query_devices(kind="output")
+        row(True, "speaker", dev["name"])
+    except Exception as e:
+        row(False, "speaker", f"no output device ({e})")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(SOCK_PATH)
+        row(True, "speech-to-text", f"jarvis-daemon listening on {SOCK_PATH}")
+    except OSError:
+        row(False, "speech-to-text", f"jarvis-daemon not reachable at {SOCK_PATH} "
+                                     "(systemctl --user status jarvis-daemon)")
+    try:
+        tags = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3).json().get("models", [])
+        names = {m.get("name") for m in tags}
+        have = LLM_MODEL in names or f"{LLM_MODEL}:latest" in names
+        row(have, "language model", f"{LLM_MODEL} {'available' if have else 'not pulled: ollama pull ' + LLM_MODEL}"
+                                    f" at {OLLAMA_URL}")
+    except Exception:
+        row(False, "language model", f"Ollama not reachable at {OLLAMA_URL}")
+    audio, rate = synthesize("test")
+    row(audio is not None, "voice", VOICE_MODEL if audio is not None else f"can't synthesize with {VOICE_MODEL}")
+    tools = typing_tools()
+    row(bool(tools), "dictation typing", ", ".join(tools) if tools else
+        "no typing tool: install ydotool (any), wtype (wlroots Wayland) or xdotool (X11)", required=False)
+    row("pactl" in ALLOWED_CMDS or "wpctl" in ALLOWED_CMDS, "volume control",
+        "pactl" if "pactl" in ALLOWED_CMDS else ("wpctl" if "wpctl" in ALLOWED_CMDS else "install pactl or wpctl"),
+        required=False)
+    row("playerctl" in ALLOWED_CMDS, "media control", "playerctl" if "playerctl" in ALLOWED_CMDS
+        else "install playerctl", required=False)
+    row("brightnessctl" in ALLOWED_CMDS, "brightness", "brightnessctl" if "brightnessctl" in ALLOWED_CMDS
+        else "install brightnessctl (laptops)", required=False)
+    row(bool(APPS), "apps", ", ".join(APPS) or "none of the known apps found", required=False)
+    print("\nEverything required is working." if ok_all else "\nFix the FAIL lines above, then run this again.")
+    return 0 if ok_all else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("doctor", "--doctor"):
+        sys.exit(doctor())
+    if QT_ERROR is not None:
+        sys.exit(f"jarvis-ctl: Qt failed to load ({QT_ERROR}). Run: jarvis-ctl doctor")
     if not acquire_lock():
         sys.exit(0)
 

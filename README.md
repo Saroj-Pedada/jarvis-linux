@@ -8,7 +8,7 @@ A private, fully local voice assistant for the Linux desktop. Say **"Hey Jarvis"
 - **Voice**: [Piper](https://github.com/rhasspy/piper) text-to-speech
 - **Dictation mode**: speak and have the text typed into any window
 
-Built and tested on EndeavourOS (Arch) with KDE Plasma on Wayland and a 4 GB GTX 1650. Other distros and desktops should work with small changes; see [Compatibility](#compatibility).
+Works on any modern Linux desktop (Wayland or X11, systemd or not). Developed on EndeavourOS with KDE Plasma and a 4 GB GTX 1650; the installer is also tested on Ubuntu and Fedora. See [Compatibility](#compatibility).
 
 ## What it can do
 
@@ -56,7 +56,8 @@ Built and tested on EndeavourOS (Arch) with KDE Plasma on Wayland and a 4 GB GTX
 
 The language model never gets a shell. Its suggested command is split with `shlex` and run directly, and only if the program is on the allowlist (`ALLOWED_CMDS` in `bin/jarvis-ctl`):
 
-`pactl`, `wpctl`, `brightnessctl` (volume/mute/brightness subcommands only), `playerctl` (play/pause/next/previous/stop), `xdg-open` (http/https URLs only), `firefox`, `dolphin`, `konsole`, `kate`, `spectacle`, `systemsettings`.
+- controls: `pactl`, `wpctl`, `brightnessctl` (volume/mute/brightness subcommands only), `playerctl` (play/pause/next/previous/stop), `xdg-open` (http/https URLs only)
+- apps: common browsers, file managers, terminals, editors, screenshot and settings tools (KDE, GNOME, Xfce, Cinnamon, MATE), **only the ones actually installed**. Add more with `JARVIS_EXTRA_APPS`.
 
 Anything else, including `sudo`, `rm`, absolute paths and shell syntax (`;`, `|`, `$()`, redirects), is refused.
 
@@ -67,33 +68,56 @@ Anything else, including `sudo`, `rm`, absolute paths and shell syntax (`;`, `|`
 
 ## Install
 
-### 1. System packages
-
-Arch / EndeavourOS:
-
 ```bash
-sudo pacman -S python uv ollama alsa-utils libpulse ydotool wl-clipboard playerctl brightnessctl
-yay -S piper-tts-bin piper-voices-minimal        # AUR
-# NVIDIA GPU: use ollama-cuda instead of ollama for fast replies
-sudo systemctl enable --now ollama
-systemctl --user enable --now ydotool             # needed for dictation typing
-```
-
-### 2. Jarvis
-
-```bash
-git clone https://github.com/<you>/jarvis-linux.git
+git clone https://github.com/Saroj-Pedada/jarvis-linux.git
 cd jarvis-linux
-./install.sh
+./install.sh --deps
 ```
 
-The installer (no root needed) creates a Python environment in `~/.local/share/jarvis/.venv`, installs the scripts to `~/.local/bin`, downloads the wake word model, starts the user services and pulls the language model.
+`--deps` installs the system packages with your package manager (pacman, apt, dnf or zypper, using `sudo`) and Ollama if it's missing. Leave it out if you'd rather install them yourself.
 
-Options: `--no-wake` (shortcuts only, no always-on mic), `--no-cuda` (CPU-only Whisper), `--skip-model` (don't run `ollama pull`).
+The rest needs no root. The installer:
 
-### 3. Keyboard shortcuts (optional)
+1. installs [uv](https://docs.astral.sh/uv/) if needed and creates a Python 3.12 environment in `~/.local/share/jarvis/.venv` (your system Python version doesn't matter)
+2. installs the Python packages, plus CUDA libraries if an NVIDIA GPU is found
+3. downloads the "Hey Jarvis" wake word model and the Piper voice
+4. installs `jarvis-ctl`, `jarvis-daemon` and `jarvis-wake` to `~/.local/bin`
+5. starts the background services (systemd user services, or desktop autostart on systems without systemd)
+6. adds keyboard shortcuts on GNOME, pulls the language model, and runs `jarvis-ctl doctor`
 
-KDE: **System Settings → Keyboard → Shortcuts → Add New → Application**, then pick **Jarvis Assistant** (e.g. `Meta+Space`) and **Jarvis Dictation** (e.g. `Meta+D`).
+| Option | Effect |
+|---|---|
+| `--deps` | also install system packages and Ollama (uses sudo) |
+| `--no-wake` | no always-on mic; shortcuts only |
+| `--no-cuda` | CPU-only Whisper even with an NVIDIA GPU |
+| `--no-ollama` | don't install Ollama or pull a model (e.g. it runs on another machine: set `JARVIS_OLLAMA_URL`) |
+| `--skip-model` | don't run `ollama pull` |
+| `--no-shortcuts` | don't add GNOME shortcuts |
+
+Re-run `./install.sh` any time to update after a `git pull`. Your settings are kept.
+
+### Keyboard shortcuts
+
+| Desktop | How |
+|---|---|
+| GNOME | added automatically: `Super+J` (assist), `Super+Shift+J` (dictate) |
+| KDE Plasma | System Settings → Keyboard → Shortcuts → Add New → Application → **Jarvis Assistant** / **Jarvis Dictation** |
+| Others (Xfce, Cinnamon, Sway, Hyprland, …) | bind a key to `~/.local/bin/jarvis-ctl assist` and `~/.local/bin/jarvis-ctl dictate` |
+
+Example for Sway / Hyprland:
+
+```
+bindsym $mod+j exec ~/.local/bin/jarvis-ctl assist          # sway
+bind = SUPER, J, exec, ~/.local/bin/jarvis-ctl assist       # hyprland
+```
+
+### Check it works
+
+```bash
+jarvis-ctl doctor
+```
+
+This checks the mic, speaker, speech-to-text daemon, Ollama and model, voice, typing tool, volume/media/brightness control and which apps Jarvis can open, and tells you how to fix anything missing.
 
 ## Using it
 
@@ -102,18 +126,20 @@ KDE: **System Settings → Keyboard → Shortcuts → Add New → Application**,
 
 ## Configuration
 
-Settings live in `~/.config/jarvis/jarvis.env` (created from [`jarvis.env.example`](jarvis.env.example)). After changing them, run `systemctl --user restart jarvis-daemon jarvis-wake`.
+Settings live in `~/.config/jarvis/jarvis.env` (created from [`jarvis.env.example`](jarvis.env.example)). After changing them, run `systemctl --user restart jarvis-daemon jarvis-wake` (or log out and back in without systemd).
 
 | Variable | Default | What it does |
 |---|---|---|
 | `JARVIS_LLM` | `qwen2.5:3b` | Ollama model for understanding and replies |
 | `JARVIS_OLLAMA_URL` | `http://localhost:11434` | Ollama server |
-| `JARVIS_WHISPER` | `small.en` | Whisper model (`base.en` is faster, `distil-small.en` is a good middle ground) |
-| `JARVIS_VOICE` | Piper `en_US-ryan-high` | Path to a Piper `.onnx` voice |
+| `JARVIS_WHISPER` | `small.en` | Whisper model on the GPU (`base.en` is faster, `distil-small.en` is a good middle ground) |
+| `JARVIS_WHISPER_CPU` | `base.en` | Whisper model used when there's no NVIDIA GPU |
+| `JARVIS_VOICE` | `~/.local/share/jarvis/voices/en_US-ryan-high.onnx` | Path to a Piper `.onnx` voice ([voice list](https://huggingface.co/rhasspy/piper-voices)) |
+| `JARVIS_EXTRA_APPS` | *(none)* | Extra apps Jarvis may open, comma-separated, e.g. `obsidian,thunderbird` |
 | `JARVIS_CITY` | *(from IP)* | City for weather questions |
 | `JARVIS_WAKE_THRESHOLD` | `0.5` | Wake word sensitivity; raise if it wakes by mistake |
 
-To allow more programs, edit `ALLOWED_CMDS` in `bin/jarvis-ctl` and re-run `./install.sh`.
+To try another voice: `~/.local/share/jarvis/.venv/bin/python -m piper.download_voices en_GB-alan-medium --download-dir ~/.local/share/jarvis/voices`, then point `JARVIS_VOICE` at it.
 
 ## Models and licenses
 
@@ -122,25 +148,37 @@ To allow more programs, edit `ALLOWED_CMDS` in `bin/jarvis-ctl` and re-run `./in
 | Wake word | openWakeWord `hey_jarvis_v0.1` | ~1.3 MB, CPU | Apache 2.0 (code); model CC BY-NC-SA 4.0 |
 | Speech to text | Whisper `small.en` | 244M params, ~670 MB VRAM | MIT |
 | Language model | `qwen2.5:3b` | ~2 GB | Qwen Research License |
-| Voice | Piper `en_US-ryan-high` | ~120 MB, CPU | see the voice's model card |
+| Voice | Piper `en_US-ryan-high` | ~120 MB, CPU | Piper is GPL-3.0 (used as a separate library); voice: see its model card |
 
 On a 4 GB GPU, Whisper plus a 3B model fit with a little spill-over to the CPU. Typical timing: about 2 s to transcribe, under 1 s for the model reply.
 
 ## Troubleshooting
 
+Start with `jarvis-ctl doctor`. Then:
+
 ```bash
-journalctl --user -u jarvis-wake -u jarvis-daemon -f   # live logs
+journalctl --user -u jarvis-wake -u jarvis-daemon -f   # live logs (systemd)
 ```
 
-- **"Hey Jarvis" doesn't respond**: the wake listener logs a status line every 30 s (`alive: mic level …, best score …`). A mic level near 0 means the mic isn't reaching it (check your default input in system settings); a low best score while you're speaking means try speaking closer or lower `JARVIS_WAKE_THRESHOLD`.
-- **"Couldn't reach the local model"**: check `systemctl status ollama` and that the model is pulled (`ollama list`). On CPU-only machines the first reply after loading can take a minute.
-- **Dictation doesn't type**: make sure `ydotool` is running (`systemctl --user status ydotool`).
+- **"Hey Jarvis" doesn't respond**: the wake listener logs a status line every 30 s (`alive: mic level …, best score …`). A mic level near 0 means the mic isn't reaching it (check your default input device); a low best score while you're speaking means speak closer or lower `JARVIS_WAKE_THRESHOLD`.
+- **"Couldn't reach the local model"**: check `systemctl status ollama` and `ollama list`. On CPU-only machines the first reply after loading can take a minute.
+- **Dictation doesn't type**: `ydotool` needs its daemon (`systemctl --user enable --now ydotool`, or `ydotoold` on some distros) and access to `/dev/uinput`. On Sway/Hyprland, `wtype` works without that; on X11, `xdotool`.
+- **The overlay doesn't appear (Ubuntu/Debian)**: install Qt's runtime libraries: `sudo apt install libxcb-cursor0 libegl1` (included in `--deps`).
 
 ## Compatibility
 
-- **Desktop**: the shortcut files and default allowlisted apps are KDE-specific (`dolphin`, `konsole`, `kate`, …). On GNOME, add `nautilus`, `gnome-terminal` etc. to `ALLOWED_CMDS` and bind shortcuts to `~/.local/bin/jarvis-ctl assist`.
-- **Audio**: needs PipeWire or PulseAudio (`pactl`).
-- **GPU**: optional. Without NVIDIA, Whisper falls back to `base.en` on the CPU.
+| | Supported |
+|---|---|
+| Distros | Arch / EndeavourOS / Manjaro, Debian / Ubuntu / Mint / Pop!_OS, Fedora, openSUSE; others with the [manual packages](#manual-system-packages) |
+| Desktops | KDE Plasma, GNOME, Xfce, Cinnamon, MATE, Sway, Hyprland, … |
+| Display | Wayland and X11 |
+| Init | systemd (user services) or anything else (XDG autostart) |
+| Audio | PipeWire or PulseAudio |
+| GPU | NVIDIA (CUDA) for fastest Whisper; AMD/Intel/none fall back to CPU. Ollama uses AMD GPUs too via ROCm |
+
+### Manual system packages
+
+If you don't use `--deps`, install the equivalents of: PortAudio, `pactl` (pulseaudio-utils / libpulse) or `wpctl`, `playerctl`, `brightnessctl`, a typing tool (`ydotool`, `wtype` or `xdotool`), `wl-clipboard`/`xclip`, `curl`, the Qt xcb/EGL runtime libraries, and [Ollama](https://ollama.com/download).
 
 ## Uninstall
 

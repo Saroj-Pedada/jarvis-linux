@@ -31,13 +31,14 @@ SOCK_PATH = os.environ.get("JARVIS_SOCK", os.path.join(os.environ.get("XDG_RUNTI
 if os.path.exists(SOCK_PATH):
     os.remove(SOCK_PATH)
 
-WHISPER_MODEL = os.environ.get("JARVIS_WHISPER", "small.en")
+WHISPER_MODEL = os.environ.get("JARVIS_WHISPER", "small.en")  # used on the GPU
 
 # Keep Whisper warm in NVIDIA VRAM permanently (~670MB VRAM for small.en)
 try:
     model = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
 except Exception:
-    model = WhisperModel("base.en", device="cpu", compute_type="int8")
+    # No usable NVIDIA GPU: a smaller model keeps CPU transcription fast.
+    model = WhisperModel(os.environ.get("JARVIS_WHISPER_CPU", "base.en"), device="cpu", compute_type="int8")
 
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(SOCK_PATH)

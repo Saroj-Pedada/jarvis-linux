@@ -49,31 +49,36 @@ def main():
         triggered = False
         # Mic is opened per listening session and closed before jarvis-ctl runs,
         # so the two never compete for it and Jarvis's own voice can't re-trigger it.
-        with sd.InputStream(samplerate=16000, channels=1, dtype="int16", blocksize=FRAME) as stream:
-            beat_t, beat_rms, beat_score, beat_n, beat_busy, beat_over = time.time(), 0.0, 0.0, 0, 0, 0
-            while not triggered:
-                data, overflow = stream.read(FRAME)
-                frame = np.squeeze(data)
-                beat_rms += float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
-                beat_n += 1
-                beat_over += int(bool(overflow))
-                if jarvis_busy():
-                    beat_busy += 1
-                    model.reset()
-                else:
-                    score = model.predict(frame)["hey_jarvis"]
-                    beat_score = max(beat_score, score)
-                    if score >= THRESHOLD:
-                        print(f"Wake word heard (score {score:.2f})", flush=True)
-                        triggered = True
-                if time.time() - beat_t >= 30:
-                    avg = beat_rms / max(beat_n, 1)
-                    print(f"alive: mic level {avg:.0f}, best score {beat_score:.2f}, "
-                          f"busy frames {beat_busy}, overflows {beat_over}", flush=True)
-                    if avg < 1.0:  # mic stream went dead (all zeros): reopen it
-                        print("Mic stream silent, reopening", flush=True)
-                        break
-                    beat_t, beat_rms, beat_score, beat_n, beat_busy, beat_over = time.time(), 0.0, 0.0, 0, 0, 0
+        try:
+            with sd.InputStream(samplerate=16000, channels=1, dtype="int16", blocksize=FRAME) as stream:
+                beat_t, beat_rms, beat_score, beat_n, beat_busy, beat_over = time.time(), 0.0, 0.0, 0, 0, 0
+                while not triggered:
+                    data, overflow = stream.read(FRAME)
+                    frame = np.squeeze(data)
+                    beat_rms += float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                    beat_n += 1
+                    beat_over += int(bool(overflow))
+                    if jarvis_busy():
+                        beat_busy += 1
+                        model.reset()
+                    else:
+                        score = model.predict(frame)["hey_jarvis"]
+                        beat_score = max(beat_score, score)
+                        if score >= THRESHOLD:
+                            print(f"Wake word heard (score {score:.2f})", flush=True)
+                            triggered = True
+                    if time.time() - beat_t >= 30:
+                        avg = beat_rms / max(beat_n, 1)
+                        print(f"alive: mic level {avg:.0f}, best score {beat_score:.2f}, "
+                              f"busy frames {beat_busy}, overflows {beat_over}", flush=True)
+                        if avg < 1.0:  # mic stream went dead (all zeros): reopen it
+                            print("Mic stream silent, reopening", flush=True)
+                            break
+                        beat_t, beat_rms, beat_score, beat_n, beat_busy, beat_over = time.time(), 0.0, 0.0, 0, 0, 0
+        except sd.PortAudioError as e:
+            print(f"Microphone unavailable ({e}); retrying in 5 s", flush=True)
+            time.sleep(5)
+            continue
         if triggered:
             t0 = time.time()
             rc = subprocess.run([JARVIS_CTL, "assist"]).returncode

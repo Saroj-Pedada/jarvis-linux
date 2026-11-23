@@ -10,3 +10,5 @@ onnxruntime>=1.18
 scipy>=1.11
 scikit-learn>=1.4
 tqdm>=4.66
+# Text-to-speech (GPL-3.0, used as a separate library) and its voice downloader
+piper-tts>=1.3
