@@ -2,7 +2,9 @@
 
 A private, fully local voice assistant for the Linux desktop. Say **"Hey Jarvis"** (or press a shortcut), ask a question or give a command, and hear the answer, all without sending your voice to the cloud.
 
-▶ **[Watch the 30-second promo video](https://github.com/Saroj-Pedada/jarvis-linux/releases/download/promo-v1/jarvis-promo-landscape.mp4)**
+[![Jarvis promo](docs/promo.gif)](https://github.com/Saroj-Pedada/jarvis-linux/releases/download/promo-v1/jarvis-promo-landscape.mp4)
+
+▶ **[Watch the full-quality video with sound](https://github.com/Saroj-Pedada/jarvis-linux/releases/download/promo-v1/jarvis-promo-landscape.mp4)**
 
 - **Wake word**: "Hey Jarvis", detected offline with [openWakeWord](https://github.com/dscripka/openWakeWord)
 - **Speech to text**: [Whisper](https://github.com/openai/whisper) `small.en` via [faster-whisper](https://github.com/SYSTRAN/faster-whisper), kept warm on the GPU
